@@ -20,6 +20,7 @@ _UNSUPPORTED_PARAM_MARKERS = (
     "not allowed",
     "invalid parameter",
     "does not support",
+    "deprecated",
 )
 
 _TEMPERATURE_VALUE_PATTERN = r"-?\d+(?:\.\d+)?"
