@@ -192,8 +192,11 @@ class YfinanceFetcher(BaseFetcher):
                 if mask.any():
                     df = df.loc[:, mask].copy()
 
-            if df.empty:
-                raise DataFetchError(f"Yahoo Finance 未查询到 {stock_code} 的数据")
+            if df is None or df.empty:
+                raise DataFetchError(
+                    f"Yahoo Finance 未返回 {stock_code} 在 {start_date}~{end_date} 的数据"
+                    "（可能是非交易日、代码错误或上游限流）"
+                )
 
             return df
 
@@ -215,6 +218,11 @@ class YfinanceFetcher(BaseFetcher):
         需要映射到标准列名：
         date, open, high, low, close, volume, amount, pct_chg
         """
+        if df is None or df.empty:
+            raise DataFetchError(
+                f"Yahoo Finance 返回 {stock_code} 的数据为空，无法标准化（可能是非交易日）"
+            )
+
         df = df.copy()
 
         # 处理 MultiIndex 列名（新版 yfinance 返回格式）
@@ -228,8 +236,12 @@ class YfinanceFetcher(BaseFetcher):
         df = df.reset_index()
 
         # 列名映射（yfinance 使用首字母大写）
+        # yfinance 偶尔会用 'Datetime'（分钟线/含时区）或 'index'（无名索引）作为日期列名，
+        # 一并映射为 'date'，避免 _normalize_data 抛 KeyError。
         column_mapping = {
             'Date': 'date',
+            'Datetime': 'date',
+            'index': 'date',
             'Open': 'open',
             'High': 'high',
             'Low': 'low',
@@ -239,14 +251,19 @@ class YfinanceFetcher(BaseFetcher):
 
         df = df.rename(columns=column_mapping)
 
+        if 'date' not in df.columns or 'close' not in df.columns:
+            raise DataFetchError(
+                f"Yahoo Finance 返回 {stock_code} 的数据缺少 date/close 列，"
+                f"实际列={list(df.columns)}"
+            )
+
         # 计算涨跌幅（因为 yfinance 不直接提供）
-        if 'close' in df.columns:
-            df['pct_chg'] = df['close'].pct_change() * 100
-            df['pct_chg'] = df['pct_chg'].fillna(0).round(2)
+        df['pct_chg'] = df['close'].pct_change() * 100
+        df['pct_chg'] = df['pct_chg'].fillna(0).round(2)
 
         # 计算成交额（yfinance 不提供，使用估算值）
         # 成交额 ≈ 成交量 * 平均价格
-        if 'volume' in df.columns and 'close' in df.columns:
+        if 'volume' in df.columns:
             df['amount'] = df['volume'] * df['close']
         else:
             df['amount'] = 0
@@ -655,7 +672,12 @@ class YfinanceFetcher(BaseFetcher):
         获取美股/美股指数实时行情数据
 
         支持美股股票（AAPL、TSLA）和美股指数（SPX、DJI 等）。
-        数据来源：yfinance Ticker.info
+        数据来源：yfinance Ticker.info（含盘前/盘后字段），fast_info 兜底。
+
+        T1：根据 ``infer_us_extended_session()`` 选择展示价（盘前用 preMarketPrice、
+        盘后用 postMarketPrice，其余时段用 regularMarketPrice 或最近收盘价），并将
+        market_state / pre_market_price / post_market_price / regular_close /
+        last_trade_date 透传到 UnifiedRealtimeQuote，便于下游 LLM 区分时段。
 
         Args:
             stock_code: 美股代码或指数代码，如 'AMD', 'AAPL', 'SPX', 'DJI'
@@ -680,68 +702,166 @@ class YfinanceFetcher(BaseFetcher):
             return None
 
         try:
+            from src.core.trading_calendar import (
+                USExtendedSession,
+                infer_us_extended_session,
+            )
+        except Exception as e:
+            logger.debug(f"[Yfinance] 无法导入 USExtendedSession，回退到常规会话: {e}")
+            USExtendedSession = None  # type: ignore[assignment]
+            infer_us_extended_session = None  # type: ignore[assignment]
+
+        try:
             symbol = stock_code.strip().upper()
-            logger.debug(f"[Yfinance] 获取美股 {symbol} 实时行情")
+            session = (
+                infer_us_extended_session()
+                if infer_us_extended_session is not None
+                else None
+            )
+            logger.debug(f"[Yfinance] 获取美股 {symbol} 实时行情，会话={session}")
 
             ticker = yf.Ticker(symbol)
 
-            # 尝试获取 fast_info（更快，但字段较少）
+            # === 优先尝试 ticker.info：包含盘前/盘后/marketState 等字段 ===
+            info_dict: Dict[str, Any] = {}
             try:
-                info = ticker.fast_info
-                if info is None:
-                    raise ValueError("fast_info is None")
+                raw_info = ticker.info
+                if isinstance(raw_info, dict):
+                    info_dict = raw_info
+            except Exception as info_err:
+                logger.debug(f"[Yfinance] ticker.info 获取失败: {info_err}")
 
-                price = getattr(info, 'lastPrice', None) or getattr(info, 'last_price', None)
-                prev_close = getattr(info, 'previousClose', None) or getattr(info, 'previous_close', None)
-                open_price = getattr(info, 'open', None)
-                high = getattr(info, 'dayHigh', None) or getattr(info, 'day_high', None)
-                low = getattr(info, 'dayLow', None) or getattr(info, 'day_low', None)
-                volume = getattr(info, 'lastVolume', None) or getattr(info, 'last_volume', None)
-                market_cap = getattr(info, 'marketCap', None) or getattr(info, 'market_cap', None)
+            regular_price = info_dict.get('regularMarketPrice')
+            pre_market_price = info_dict.get('preMarketPrice')
+            post_market_price = info_dict.get('postMarketPrice')
+            yahoo_market_state = info_dict.get('marketState')  # PRE / REGULAR / POST / CLOSED
+            prev_close = (
+                info_dict.get('regularMarketPreviousClose')
+                or info_dict.get('previousClose')
+            )
+            open_price = info_dict.get('regularMarketOpen') or info_dict.get('open')
+            high = info_dict.get('regularMarketDayHigh') or info_dict.get('dayHigh')
+            low = info_dict.get('regularMarketDayLow') or info_dict.get('dayLow')
+            volume = info_dict.get('regularMarketVolume') or info_dict.get('volume')
+            market_cap = info_dict.get('marketCap')
 
-            except Exception:
-                # 回退到 history 方法获取最新数据
-                logger.debug("[Yfinance] fast_info 失败，尝试 history 方法")
-                hist = ticker.history(period='2d')
-                if hist.empty:
+            # === fast_info 兜底：当 ticker.info 不可用时仍能拿到常规价 ===
+            if regular_price is None and prev_close is None:
+                try:
+                    fast = ticker.fast_info
+                    if fast is not None:
+                        regular_price = (
+                            getattr(fast, 'lastPrice', None)
+                            or getattr(fast, 'last_price', None)
+                        )
+                        prev_close = (
+                            getattr(fast, 'previousClose', None)
+                            or getattr(fast, 'previous_close', None)
+                        )
+                        open_price = open_price or getattr(fast, 'open', None)
+                        high = high or (
+                            getattr(fast, 'dayHigh', None)
+                            or getattr(fast, 'day_high', None)
+                        )
+                        low = low or (
+                            getattr(fast, 'dayLow', None)
+                            or getattr(fast, 'day_low', None)
+                        )
+                        volume = volume or (
+                            getattr(fast, 'lastVolume', None)
+                            or getattr(fast, 'last_volume', None)
+                        )
+                        market_cap = market_cap or (
+                            getattr(fast, 'marketCap', None)
+                            or getattr(fast, 'market_cap', None)
+                        )
+                except Exception as fast_err:
+                    logger.debug(f"[Yfinance] fast_info 兜底失败: {fast_err}")
+
+            # === 最终兜底：history(prepost=True) 直接读盘前/盘后/常规最后一根 ===
+            last_trade_date: Optional[str] = None
+            if regular_price is None and prev_close is None:
+                logger.debug("[Yfinance] info+fast_info 均无数据，尝试 history(prepost) 兜底")
+                try:
+                    hist = ticker.history(period='5d', prepost=True)
+                except Exception as hist_err:
+                    logger.debug(f"[Yfinance] history 兜底失败: {hist_err}")
+                    hist = None
+                if hist is None or hist.empty:
                     logger.warning(f"[Yfinance] 无法获取 {symbol} 的数据，尝试 Stooq 兜底")
                     return self._get_us_stock_quote_from_stooq(symbol)
 
                 today = hist.iloc[-1]
                 prev = hist.iloc[-2] if len(hist) > 1 else today
-
-                price = float(today['Close'])
+                regular_price = float(today['Close'])
                 prev_close = float(prev['Close'])
                 open_price = float(today['Open'])
                 high = float(today['High'])
                 low = float(today['Low'])
                 volume = int(today['Volume'])
-                market_cap = None
+                try:
+                    last_trade_date = hist.index[-1].date().isoformat()
+                except Exception:
+                    last_trade_date = None
 
-            # 计算涨跌幅
-            change_amount = None
-            change_pct = None
-            if price is not None and prev_close is not None and prev_close > 0:
-                change_amount = price - prev_close
+            # === 根据当前会话选择展示价 ===
+            display_price: Optional[float] = None
+            chosen_label = "regular"
+            if session is not None and USExtendedSession is not None:
+                if session == USExtendedSession.PRE_MARKET and pre_market_price:
+                    display_price = pre_market_price
+                    chosen_label = "pre_market"
+                elif session == USExtendedSession.AFTER_HOURS and post_market_price:
+                    display_price = post_market_price
+                    chosen_label = "after_hours"
+
+            if display_price is None:
+                # 常规时段 / 隔夜 / 周末 / 节假日：用常规价（或退到 history 取的最后一根）
+                display_price = regular_price
+
+            # === 计算涨跌幅 / 振幅（均相对于上一个常规交易日的收盘）===
+            change_amount: Optional[float] = None
+            change_pct: Optional[float] = None
+            if display_price is not None and prev_close is not None and prev_close > 0:
+                change_amount = display_price - prev_close
                 change_pct = (change_amount / prev_close) * 100
 
-            # 计算振幅
-            amplitude = None
-            if high is not None and low is not None and prev_close is not None and prev_close > 0:
+            amplitude: Optional[float] = None
+            if (
+                high is not None
+                and low is not None
+                and prev_close is not None
+                and prev_close > 0
+            ):
                 amplitude = ((high - low) / prev_close) * 100
 
-            # 获取股票名称
+            # === 股票名称 ===
             try:
-                info_name = ticker.info.get('shortName', '') or ticker.info.get('longName', '') or ''
-                name = info_name if is_meaningful_stock_name(info_name, symbol) else STOCK_NAME_MAP.get(symbol, '')
+                info_name = (
+                    info_dict.get('shortName', '')
+                    or info_dict.get('longName', '')
+                    or ''
+                )
+                name = (
+                    info_name
+                    if is_meaningful_stock_name(info_name, symbol)
+                    else STOCK_NAME_MAP.get(symbol, '')
+                )
             except Exception:
                 name = STOCK_NAME_MAP.get(symbol, '')
+
+            # === 组装会话标签（优先内部判定，Yahoo 仅作兜底）===
+            session_label: Optional[str] = None
+            if session is not None:
+                session_label = session.value
+            elif isinstance(yahoo_market_state, str):
+                session_label = yahoo_market_state.lower()
 
             quote = UnifiedRealtimeQuote(
                 code=symbol,
                 name=name,
                 source=RealtimeSource.FALLBACK,
-                price=price,
+                price=display_price,
                 change_pct=round(change_pct, 2) if change_pct is not None else None,
                 change_amount=round(change_amount, 4) if change_amount is not None else None,
                 volume=volume,
@@ -757,9 +877,18 @@ class YfinanceFetcher(BaseFetcher):
                 pb_ratio=None,
                 total_mv=market_cap,
                 circ_mv=None,
+                market_state=session_label,
+                pre_market_price=pre_market_price,
+                post_market_price=post_market_price,
+                regular_close=regular_price,
+                last_trade_date=last_trade_date,
             )
 
-            logger.info(f"[Yfinance] 获取美股 {symbol} 实时行情成功: 价格={price}")
+            logger.info(
+                f"[Yfinance] 获取美股 {symbol} 实时行情成功: 会话={session_label} "
+                f"展示价={display_price} ({chosen_label}) 常规价={regular_price} "
+                f"盘前={pre_market_price} 盘后={post_market_price}"
+            )
             return quote
 
         except Exception as e:

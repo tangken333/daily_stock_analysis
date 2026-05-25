@@ -596,6 +596,12 @@ class StockAnalysisPipeline:
                 'circ_mv': getattr(realtime_quote, 'circ_mv', None),
                 'change_60d': getattr(realtime_quote, 'change_60d', None),
                 'source': getattr(realtime_quote, 'source', None),
+                # T1: 会话感知字段（仅美股 yfinance 填充），让 LLM 区分盘前/盘后/隔夜价
+                'market_state': getattr(realtime_quote, 'market_state', None),
+                'pre_market_price': getattr(realtime_quote, 'pre_market_price', None),
+                'post_market_price': getattr(realtime_quote, 'post_market_price', None),
+                'regular_close': getattr(realtime_quote, 'regular_close', None),
+                'last_trade_date': getattr(realtime_quote, 'last_trade_date', None),
             }
             # 移除 None 值以减少上下文大小
             enhanced['realtime'] = {k: v for k, v in enhanced['realtime'].items() if v is not None}

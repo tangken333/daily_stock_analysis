@@ -147,7 +147,16 @@ class UnifiedRealtimeQuote:
     change_60d: Optional[float] = None      # 60日涨跌幅(%)
     high_52w: Optional[float] = None        # 52周最高
     low_52w: Optional[float] = None         # 52周最低
-    
+
+    # === 美股盘前盘后 / 会话感知字段（T1，仅美股 yfinance 填充）===
+    # 取值范围参考 USExtendedSession：pre_market / regular / after_hours /
+    # overnight / weekend / holiday / unknown。
+    market_state: Optional[str] = None      # 触发时所处会话
+    pre_market_price: Optional[float] = None    # 盘前最新价（若有）
+    post_market_price: Optional[float] = None   # 盘后最新价（若有）
+    regular_close: Optional[float] = None       # 上一次常规交易的收盘价
+    last_trade_date: Optional[str] = None       # 最近一次成交日期(YYYY-MM-DD)
+
     def to_dict(self) -> Dict[str, Any]:
         """转换为字典（过滤 None 值）"""
         result = {
@@ -161,7 +170,9 @@ class UnifiedRealtimeQuote:
             'volume_ratio', 'turnover_rate', 'amplitude',
             'open_price', 'high', 'low', 'pre_close',
             'pe_ratio', 'pb_ratio', 'total_mv', 'circ_mv',
-            'change_60d', 'high_52w', 'low_52w'
+            'change_60d', 'high_52w', 'low_52w',
+            'market_state', 'pre_market_price', 'post_market_price',
+            'regular_close', 'last_trade_date',
         ]
         for f in optional_fields:
             val = getattr(self, f, None)

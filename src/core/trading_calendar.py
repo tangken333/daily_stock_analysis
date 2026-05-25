@@ -14,7 +14,7 @@
 """
 
 import logging
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, time as dtime, timedelta
 from enum import Enum
 from typing import Any, Optional, Set
 from zoneinfo import ZoneInfo
@@ -60,6 +60,30 @@ class MarketPhase(str, Enum):
     POSTMARKET = "postmarket"
     NON_TRADING = "non_trading"
     UNKNOWN = "unknown"
+
+
+class USExtendedSession(str, Enum):
+    """US extended-hours session labels for any-time-trigger awareness.
+
+    Wider than ``MarketPhase`` for US: distinguishes pre-market / regular /
+    after-hours / overnight / weekend / holiday so callers (e.g. realtime
+    quote fetchers) can pick the correct displayed price field.
+    """
+
+    PRE_MARKET = "pre_market"     # 04:00-09:30 ET on a trading day
+    REGULAR = "regular"           # 09:30-16:00 ET on a trading day
+    AFTER_HOURS = "after_hours"   # 16:00-20:00 ET on a trading day
+    OVERNIGHT = "overnight"       # 20:00-04:00 ET between two trading days
+    WEEKEND = "weekend"           # Saturday / Sunday
+    HOLIDAY = "holiday"           # NYSE-closed weekday
+    UNKNOWN = "unknown"
+
+
+# Standard NYSE extended-hours windows in ET.
+_US_PRE_MARKET_OPEN = dtime(4, 0)
+_US_REGULAR_OPEN = dtime(9, 30)
+_US_REGULAR_CLOSE = dtime(16, 0)
+_US_AFTER_HOURS_CLOSE = dtime(20, 0)
 
 
 def get_market_for_stock(code: str) -> Optional[str]:
@@ -290,6 +314,64 @@ def infer_market_phase(
     except Exception as e:
         logger.warning("trading_calendar.infer_market_phase fail-closed: %s", e)
         return MarketPhase.UNKNOWN
+
+
+def infer_us_extended_session(
+    current_time: Optional[datetime] = None,
+) -> USExtendedSession:
+    """Classify the current US session for any-time-trigger flows.
+
+    Returns a label among ``USExtendedSession`` so realtime fetchers can pick
+    the correct displayed price (pre-market / regular / after-hours / last
+    close). Fail-closed on calendar errors (returns ``UNKNOWN``), independent
+    from the broader fail-open trading-day filtering used elsewhere.
+
+    The function uses NYSE regular-session boundaries from
+    ``exchange_calendars`` when available (so early-close days are handled
+    correctly) and falls back to the standard 09:30-16:00 ET window otherwise.
+    """
+    market_now = get_market_now("us", current_time=current_time)
+    local_date = market_now.date()
+    local_t = market_now.time()
+    weekday = local_date.weekday()
+
+    if weekday >= 5:
+        return USExtendedSession.WEEKEND
+
+    regular_open = _US_REGULAR_OPEN
+    regular_close = _US_REGULAR_CLOSE
+    is_trading_day = True
+
+    if _XCALS_AVAILABLE:
+        try:
+            cal = xcals.get_calendar(MARKET_EXCHANGE["us"])
+            if not cal.is_session(local_date):
+                return USExtendedSession.HOLIDAY
+
+            session = cal.date_to_session(local_date, direction="previous")
+            tz_name = MARKET_TIMEZONE["us"]
+            session_open = _as_market_datetime(cal.session_open(session), tz_name)
+            session_close = _as_market_datetime(cal.session_close(session), tz_name)
+            if session_open is not None and session_open.date() == local_date:
+                regular_open = session_open.time()
+            if session_close is not None and session_close.date() == local_date:
+                regular_close = session_close.time()
+        except Exception as e:
+            logger.warning("trading_calendar.infer_us_extended_session fail-closed: %s", e)
+            return USExtendedSession.UNKNOWN
+
+    if not is_trading_day:
+        return USExtendedSession.HOLIDAY
+
+    if local_t < _US_PRE_MARKET_OPEN:
+        return USExtendedSession.OVERNIGHT
+    if local_t < regular_open:
+        return USExtendedSession.PRE_MARKET
+    if local_t < regular_close:
+        return USExtendedSession.REGULAR
+    if local_t < _US_AFTER_HOURS_CLOSE:
+        return USExtendedSession.AFTER_HOURS
+    return USExtendedSession.OVERNIGHT
 
 
 def get_open_markets_today() -> Set[str]:
